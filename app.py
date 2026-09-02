@@ -52,8 +52,12 @@ def suppress_c_stdout_stderr():
             pass
 
 
-MODEL_REPO = "unsloth/gemma-4-26B-A4B-it-GGUF"
-MODEL_FILE = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+# MODEL_REPO = "unsloth/gemma-4-26B-A4B-it-GGUF"
+# MODEL_FILE = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+# MMPROJ_FILE = "mmproj-F32.gguf"
+
+MODEL_REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+MODEL_FILE = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 MMPROJ_FILE = "mmproj-F32.gguf"
 
 llm_instance = None
