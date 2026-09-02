@@ -25,12 +25,12 @@ from llama_cpp import Llama
 from llama_cpp.llama_chat_format import Qwen35ChatHandler
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("gemma_studio")
+logging.basicConfig(level=logging.CRITICAL)
+logger = logging.getLogger("qwen36 studio")
 
 
 @contextmanager
-def suppress_c_stdout_stderr():
+def suppress_stdout_stderr():
     """Safely redirects C/C++ engine file descriptors to /dev/null during inference."""
     try:
         null_fd = os.open(os.devnull, os.O_RDWR)
@@ -64,18 +64,18 @@ llm_instance = None
 session_keys: Dict[str, Tuple[ec.EllipticCurvePrivateKey, float]] = {}
 tasks: Dict[str, dict] = {}
 
-HKDF_SALT = b"gemma-vision-zero-leak-salt-2025"
-HKDF_INFO = b"gemma-vision-e2ee"
+HKDF_SALT = b"qwen-vision-zero-leak-salt-2025"
+HKDF_INFO = b"qwen-vision-e2ee"
 
 
-def zero_memory(target):
+def zero_mem(target):
     """Wipes mutable memory buffers with zeros."""
     if isinstance(target, (bytearray, memoryview)):
         for i in range(len(target)):
             target[i] = 0
 
 
-def sanitize_image_data_uri(image_str: str) -> str:
+def sanitize_img_data_uri(image_str: str) -> str:
     """Normalizes any base64 image data URI to strict RFC-compliant format."""
     if not image_str:
         return ""
@@ -150,7 +150,7 @@ async def lifespan(app: FastAPI):
     gc.collect()
 
 
-app = FastAPI(title="Gemma 4 Private Studio", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="Qwen 3.6 Private Studio", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 @app.middleware("http")
@@ -188,12 +188,12 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         del decrypted_raw
 
         decrypted_dict = json.loads(decrypted_buf.decode("utf-8"))
-        zero_memory(decrypted_buf)
+        zero_mem(decrypted_buf)
         del decrypted_buf
 
         prompt_str = decrypted_dict.get("prompt", "")
         raw_image_str = decrypted_dict.get("image", "")
-        image_str = sanitize_image_data_uri(raw_image_str)
+        image_str = sanitize_img_data_uri(raw_image_str)
         del raw_image_str
 
         max_tokens = int(decrypted_dict.get("max_tokens", 512))
@@ -214,7 +214,7 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         del prompt_str
         del image_str
 
-        with suppress_c_stdout_stderr():
+        with suppress_stdout_stderr():
             model.reset()
             response = model.create_chat_completion(
                 messages=messages,
@@ -235,7 +235,7 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
 
         out_iv = os.urandom(12)
         encrypted_out = aesgcm.encrypt(out_iv, bytes(resp_bytes), None)
-        zero_memory(resp_bytes)
+        zero_mem(resp_bytes)
         del resp_bytes
 
         del aesgcm
@@ -262,9 +262,6 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         }
 
 
-# ==============================================================================
-# 4. Endpoints
-# ==============================================================================
 class EncryptedPayload(BaseModel):
     session_id: str
     client_public_key: str
@@ -329,15 +326,12 @@ def check_status(task_id: str):
         return {"status": "processing"}
 
 
-# ==============================================================================
-# 5. WebUI
-# ==============================================================================
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gemma 4 Private Studio</title>
+    <title>Qwen 3.6 Private Studio</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -371,7 +365,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <i data-lucide="shield-check" class="w-5 h-5"></i>
                 </div>
                 <div>
-                    <h1 class="font-bold text-lg leading-tight tracking-tight">Gemma 4 Private Studio</h1>
+                    <h1 class="font-bold text-lg leading-tight tracking-tight">Qwen 3.6 Private Studio</h1>
                     <p class="text-xs text-slate-400">Zero Disk Logging • In-RAM Execution • In-Browser E2EE</p>
                 </div>
             </div>
@@ -489,8 +483,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         lucide.createIcons();
 
         const DEFAULT_PROMPT = "Describe this image in concise sentences. The written description will be given to a photographer so they can reproduce the image. The description should clearly describe all the relevant elements of the image.";
-        const HKDF_SALT = new TextEncoder().encode("gemma-vision-zero-leak-salt-2025");
-        const HKDF_INFO = new TextEncoder().encode("gemma-vision-e2ee");
+        const HKDF_SALT = new TextEncoder().encode("qwen-vision-zero-leak-salt-2025");
+        const HKDF_INFO = new TextEncoder().encode("qwen-vision-e2ee");
 
         let currentBase64Image = null;
         let rawOutputMarkdown = "";
