@@ -215,17 +215,14 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         del image_str
 
         with suppress_c_stdout_stderr():
+            model.reset()
             response = model.create_chat_completion(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=0.80,
                 min_p=0.05,
-                reasoning_budget=256,
-                # reasoning_budget_message="\n[reasoning budget exhausted]\n",
-                reasoning_budget_message="-\n...Wait, I have been thinking long enough. Let me start answering the user's question.\n",
-                reasoning_start="<|channel>",  # gemma 4 equivalent to <think>
-                reasoning_end="<channel|>",
+                present_penalty=0.01, repeat_penalty=1.01, penalty_last_n=64,
             )
         del messages
 
