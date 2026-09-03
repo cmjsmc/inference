@@ -318,8 +318,24 @@ def filter_overlap_tags(tags: list[str], overlap_dict: dict[str, list[str]], che
     return result
 
 
-def process_tags_pipeline(image_data: bytearray) -> tuple[str, str]:
-    """Executes WD model inference, removes overlaps, applies CHANGE_MAP, and detects IMPORTANT_TAGS in RAM."""
+def parse_banned_regex_list(regex_str: str) -> list[re.Pattern]:
+    """Safely parses comma or newline separated regex patterns."""
+    patterns = []
+    if not regex_str or not regex_str.strip():
+        return patterns
+
+    for item in re.split(r"[\n,]+", regex_str):
+        clean_item = item.strip()
+        if clean_item:
+            try:
+                patterns.append(re.compile(clean_item, re.IGNORECASE))
+            except re.error:
+                pass
+    return patterns
+
+
+def process_tags_pipeline(image_data: bytearray, banned_patterns: list[re.Pattern]) -> tuple[str, str]:
+    """Executes WD model inference, removes overlaps, applies CHANGE_MAP, bans client regexes, and detects IMPORTANT_TAGS."""
     global WD_DEVICE
     wd_model, labels, transform, overlap_dict = load_wd_tagger()
 
@@ -338,7 +354,6 @@ def process_tags_pipeline(image_data: bytearray) -> tuple[str, str]:
         try:
             outputs = wd_model(inputs)
         except (torch.cuda.OutOfMemoryError, RuntimeError):
-            # Fallback to CPU on live VRAM contention
             WD_DEVICE = torch.device("cpu")
             wd_model = wd_model.float().to("cpu")
             inputs = inputs.float().to("cpu")
@@ -358,14 +373,23 @@ def process_tags_pipeline(image_data: bytearray) -> tuple[str, str]:
     change_map_dict = {src.lower(): dst for src, dst in CHANGE_MAP}
     edited_tags = [change_map_dict.get(t.lower(), t) for t in tags_spaced]
 
-    # 4. Check IMPORTANT_TAGS
-    edited_tags_lower = {t.lower() for t in edited_tags}
-    high_tags_present = [imp for imp in IMPORTANT_TAGS if imp.lower() in edited_tags_lower]
+    # 4. Filter Banned Regex Tags (Client-Provided & Encrypted)
+    if banned_patterns:
+        sanitized_tags = [
+            t for t in edited_tags
+            if not any(pat.search(t) for pat in banned_patterns)
+        ]
+    else:
+        sanitized_tags = edited_tags
 
-    tags_present = ", ".join(edited_tags)
+    # 5. Check IMPORTANT_TAGS
+    sanitized_tags_lower = {t.lower() for t in sanitized_tags}
+    high_tags_present = [imp for imp in IMPORTANT_TAGS if imp.lower() in sanitized_tags_lower]
+
+    tags_present = ", ".join(sanitized_tags)
     high_tags_present_str = ", ".join(high_tags_present)
 
-    del inputs, outputs, probs, raw_tags, filtered_tags, tags_spaced, edited_tags, edited_tags_lower
+    del inputs, outputs, probs, raw_tags, filtered_tags, tags_spaced, edited_tags, sanitized_tags, sanitized_tags_lower
     return tags_present, high_tags_present_str
 
 
@@ -494,6 +518,8 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         del decrypted_buf
 
         prompt_str = decrypted_dict.get("prompt", "")
+        system_prompt_str = decrypted_dict.get("system_prompt", "").strip()
+        banned_regex_str = decrypted_dict.get("banned_regex", "")
         raw_image_str = decrypted_dict.get("image", "")
         image_str = sanitize_img_data_uri(raw_image_str)
         del raw_image_str
@@ -506,36 +532,51 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         b64_part = image_str.split(",", 1)[1] if "," in image_str else image_str
         image_buf = bytearray(base64.b64decode(b64_part))
 
+        banned_patterns = parse_banned_regex_list(banned_regex_str)
+
         try:
-            tags_present, high_tags_present = process_tags_pipeline(image_buf)
+            tags_present, high_tags_present = process_tags_pipeline(image_buf, banned_patterns)
         finally:
-            # Strictly wipe the decoded image buffer even if tagging fails
             zero_mem(image_buf)
             del image_buf
 
-        if tags_present:
-            tags_prompt = f"Describe the image through concise, clear sentences, making use of the following keywords, if relevant: [{tags_present}]"
-            if high_tags_present:
-                high_impact_prompt = f"{tags_prompt} You must include the following keywords: [{high_tags_present}]"
-                final_prompt = f"{prompt_str}\n\n{high_impact_prompt}".strip() if prompt_str else high_impact_prompt
-            else:
-                final_prompt = f"{prompt_str}\n\n{tags_prompt}".strip() if prompt_str else tags_prompt
-        else:
-            final_prompt = prompt_str
+        # 4. Compile Final Prompt Supporting <tags> and <hi_tags> Placeholders
+        has_tags_placeholder = "<tags>" in prompt_str
+        has_hi_tags_placeholder = "<hi_tags>" in prompt_str
 
-        # 4. Model Execution (Thread-Safe)
+        if has_tags_placeholder or has_hi_tags_placeholder:
+            # Custom template mode: replace placeholders directly
+            final_prompt = prompt_str
+            if has_tags_placeholder:
+                final_prompt = final_prompt.replace("<tags>", tags_present)
+            if has_hi_tags_placeholder:
+                final_prompt = final_prompt.replace("<hi_tags>", high_tags_present)
+        else:
+            # Standard mode: append structured tags prompt
+            if tags_present:
+                tags_prompt = f"Describe the image through concise, clear sentences, making use of the following keywords, if relevant: [{tags_present}]"
+                if high_tags_present:
+                    high_impact_prompt = f"{tags_prompt} You must include the following keywords: [{high_tags_present}]"
+                    final_prompt = f"{prompt_str}\n\n{high_impact_prompt}".strip() if prompt_str else high_impact_prompt
+                else:
+                    final_prompt = f"{prompt_str}\n\n{tags_prompt}".strip() if prompt_str else tags_prompt
+            else:
+                final_prompt = prompt_str
+
+        # 5. Model Execution (Thread-Safe with System Prompt First)
         model = load_model()
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": final_prompt},
-                    {"type": "image_url", "image_url": {"url": image_str}},
-                ],
-            }
-        ]
+        messages = []
+        if system_prompt_str:
+            messages.append({"role": "system", "content": system_prompt_str})
+
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": final_prompt},
+                {"type": "image_url", "image_url": {"url": image_str}},
+            ],
+        })
         del prompt_str
-        del final_prompt
         del image_str
 
         with llm_lock, suppress_stdout_stderr():
@@ -555,10 +596,17 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         content_str = response["choices"][0]["message"]["content"]
         del response
 
-        # 5. Re-Encrypt Response
-        resp_bytes = bytearray(json.dumps({"content": content_str}).encode("utf-8"))
+        # 6. Re-Encrypt Response with Tags and Final Prompt Metadata
+        resp_data = {
+            "content": content_str,
+            "final_prompt": final_prompt,
+            "tags": tags_present,
+            "high_tags": high_tags_present,
+        }
         del content_str
+        del final_prompt
 
+        resp_bytes = bytearray(json.dumps(resp_data).encode("utf-8"))
         out_iv = os.urandom(12)
         encrypted_out = aesgcm.encrypt(out_iv, bytes(resp_bytes), None)
         zero_mem(resp_bytes)
@@ -707,6 +755,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <!-- Left: Input Controls -->
         <div class="lg:col-span-6 flex flex-col gap-6">
 
+            <!-- Image Dropzone -->
             <div class="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 backdrop-blur shadow-sm">
                 <div class="flex items-center justify-between mb-3">
                     <label class="font-semibold text-sm flex items-center gap-2 text-slate-200">
@@ -717,7 +766,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </button>
                 </div>
 
-                <div id="dropzone" class="relative border-2 border-dashed border-slate-700 hover:border-slate-500 rounded-xl transition cursor-pointer overflow-hidden min-h-[260px] flex flex-col items-center justify-center bg-slate-950/40 group">
+                <div id="dropzone" class="relative border-2 border-dashed border-slate-700 hover:border-slate-500 rounded-xl transition cursor-pointer overflow-hidden min-h-[240px] flex flex-col items-center justify-center bg-slate-950/40 group">
                     <input type="file" id="fileInput" accept="image/*" class="hidden" />
 
                     <div id="dropzonePlaceholder" class="p-8 text-center flex flex-col items-center">
@@ -728,8 +777,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <p class="text-xs text-slate-500 mt-1">Automatically sanitizes filename to <code class="text-emerald-400">image_01.jpg</code></p>
                     </div>
 
-                    <div id="previewContainer" class="hidden relative w-full h-full min-h-[260px] flex items-center justify-center bg-slate-950 p-2">
-                        <img id="imagePreview" src="" alt="Preview" class="max-h-[360px] w-auto max-w-full rounded-lg object-contain" />
+                    <div id="previewContainer" class="hidden relative w-full h-full min-h-[240px] flex items-center justify-center bg-slate-950 p-2">
+                        <img id="imagePreview" src="" alt="Preview" class="max-h-[320px] w-auto max-w-full rounded-lg object-contain" />
                         <div class="absolute inset-0 bg-black/50 opacity-0 hover:opacity-100 transition-opacity flex items-center justify-center text-xs font-semibold text-white backdrop-blur-[2px]">
                             Drop new image or click to replace
                         </div>
@@ -737,15 +786,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </div>
 
-            <div class="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 backdrop-blur shadow-sm flex flex-col gap-3">
-                <div class="flex items-center justify-between">
-                    <label class="font-semibold text-sm flex items-center gap-2 text-slate-200">
-                        <i data-lucide="lock" class="w-4 h-4 text-emerald-400"></i> Prompt Instruction
-                    </label>
-                    <button id="resetPromptBtn" class="text-xs text-slate-400 hover:text-slate-200 transition">Reset default</button>
-                </div>
-                <textarea id="promptInput" rows="4" class="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl p-3.5 text-sm text-slate-200 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500 resize-y" placeholder="Enter prompt..."></textarea>
+            <!-- Prompts & Parameters -->
+            <div class="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 backdrop-blur shadow-sm flex flex-col gap-4">
 
+                <!-- System Prompt Input -->
+                <div>
+                    <div class="flex items-center justify-between mb-1.5">
+                        <label class="font-semibold text-xs flex items-center gap-1.5 text-slate-300">
+                            <i data-lucide="cpu" class="w-3.5 h-3.5 text-indigo-400"></i> System Prompt ("system" role)
+                        </label>
+                        <button id="clearSystemBtn" class="text-xs text-slate-500 hover:text-slate-300 transition">Clear</button>
+                    </div>
+                    <textarea id="systemPromptInput" rows="2" class="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl p-3 text-xs text-slate-200 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500 resize-y" placeholder="Optional system instructions (e.g. You are a professional photographer...)..."></textarea>
+                </div>
+
+                <!-- User Prompt Input with Placeholders -->
+                <div>
+                    <div class="flex items-center justify-between mb-1.5">
+                        <label class="font-semibold text-xs flex items-center gap-1.5 text-slate-300">
+                            <i data-lucide="message-square" class="w-3.5 h-3.5 text-brand-500"></i> User Prompt ("user" role)
+                        </label>
+                        <button id="resetPromptBtn" class="text-xs text-slate-400 hover:text-slate-200 transition">Reset default</button>
+                    </div>
+                    <textarea id="promptInput" rows="4" class="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl p-3 text-sm text-slate-200 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500 resize-y" placeholder="Enter prompt... You can use <tags> and <hi_tags> as placeholders."></textarea>
+                    <p class="text-[11px] text-slate-500 mt-1">Placeholders <code class="text-indigo-400">&lt;tags&gt;</code> and <code class="text-amber-400">&lt;hi_tags&gt;</code> are replaced with detected keywords. If omitted, tags are appended automatically.</p>
+                </div>
+
+                <!-- Client-Side Regex Ban Input -->
+                <div>
+                    <div class="flex items-center justify-between mb-1.5">
+                        <label class="font-semibold text-xs flex items-center gap-1.5 text-slate-300">
+                            <i data-lucide="shield-alert" class="w-3.5 h-3.5 text-rose-400"></i> Banned Keywords Regex (E2EE)
+                        </label>
+                        <button id="resetBannedBtn" class="text-xs text-slate-400 hover:text-slate-200 transition">Reset default</button>
+                    </div>
+                    <input type="text" id="bannedRegexInput" class="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500" value="[0-9]girl, [0-9]boy, .*mole.*, .*piercing.*" />
+                    <p class="text-[11px] text-slate-500 mt-1">Comma or newline separated regexes. Stripped entirely in RAM before model prompting.</p>
+                </div>
+
+                <!-- Sliders -->
                 <div class="grid grid-cols-2 gap-4 pt-2 border-t border-slate-800/80">
                     <div>
                         <div class="flex justify-between text-xs text-slate-400 mb-1">
@@ -763,6 +842,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- Submit Button -->
                 <button id="submitBtn" class="mt-2 w-full py-3.5 px-4 bg-brand-600 hover:bg-brand-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-medium rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-brand-500/20">
                     <i data-lucide="lock" class="w-4 h-4"></i>
                     <span id="submitBtnText">Encrypt & Run Analysis</span>
@@ -772,7 +852,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <!-- Right: Output Display -->
         <div class="lg:col-span-6 flex flex-col">
-            <div class="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 backdrop-blur shadow-sm flex-1 flex flex-col min-h-[500px]">
+            <div class="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 backdrop-blur shadow-sm flex-1 flex flex-col min-h-[560px]">
 
                 <div class="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
                     <span class="font-semibold text-sm flex items-center gap-2 text-slate-200">
@@ -785,18 +865,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </button>
                 </div>
 
-                <div id="outputContainer" class="flex-1 overflow-y-auto">
-                    <div id="emptyState" class="h-full flex flex-col items-center justify-center text-slate-500 py-16">
+                <div id="outputContainer" class="flex-1 overflow-y-auto flex flex-col gap-4">
+
+                    <!-- Tag Badges Inspection Panel (Hidden until output decrypted) -->
+                    <div id="metadataPanel" class="hidden flex flex-col gap-3 p-4 bg-slate-950/80 border border-slate-800 rounded-xl text-xs">
+                        <div id="highTagsContainer" class="hidden">
+                            <span class="text-[11px] font-semibold uppercase tracking-wider text-amber-400 block mb-1.5">High Impact Keywords</span>
+                            <div id="highTagsList" class="flex flex-wrap gap-1.5"></div>
+                        </div>
+
+                        <div id="tagsContainer" class="hidden">
+                            <span class="text-[11px] font-semibold uppercase tracking-wider text-indigo-400 block mb-1.5">Detected Image Keywords</span>
+                            <div id="tagsList" class="flex flex-wrap gap-1.5"></div>
+                        </div>
+
+                        <details class="group mt-1 pt-2 border-t border-slate-800/80 cursor-pointer">
+                            <summary class="text-slate-400 hover:text-slate-200 text-xs font-medium flex items-center justify-between select-none">
+                                <span>Compiled Prompt Sent to Model</span>
+                                <i data-lucide="chevron-down" class="w-3.5 h-3.5 group-open:rotate-180 transition-transform"></i>
+                            </summary>
+                            <div class="mt-2.5 p-3 bg-slate-900 rounded-lg font-mono text-[11px] text-slate-300 whitespace-pre-wrap border border-slate-800" id="finalPromptDisplay"></div>
+                        </details>
+                    </div>
+
+                    <!-- Empty State -->
+                    <div id="emptyState" class="h-full flex flex-col items-center justify-center text-slate-500 py-20">
                         <i data-lucide="shield" class="w-12 h-12 mb-3 text-slate-700"></i>
                         <p class="text-sm">End-to-End Encrypted environment ready.</p>
                         <p class="text-xs text-slate-600 mt-1">Upload an image and click generate to begin.</p>
                     </div>
 
-                    <div id="loadingState" class="hidden h-full flex flex-col items-center justify-center py-16 gap-3">
+                    <!-- Loading State -->
+                    <div id="loadingState" class="hidden h-full flex flex-col items-center justify-center py-20 gap-3">
                         <div class="w-8 h-8 border-4 border-emerald-500/20 border-t-emerald-500 rounded-full animate-spin"></div>
                         <p id="loadingStatusText" class="text-sm text-slate-400 animate-pulse">Running In-RAM Inference...</p>
                     </div>
 
+                    <!-- Markdown Output -->
                     <div id="markdownOutput" class="hidden prose prose-invert max-w-none text-slate-200 text-sm leading-relaxed"></div>
                 </div>
 
@@ -809,6 +914,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         lucide.createIcons();
 
         const DEFAULT_PROMPT = "Describe this image in concise sentences. The written description will be given to a photographer so they can reproduce the image. The description should clearly describe all the relevant elements of the image.";
+        const DEFAULT_BANNED = "[0-9]girl, [0-9]boy, .*mole.*, .*piercing.*";
         const HKDF_SALT = new TextEncoder().encode("qwen-vision-zero-leak-salt-2025");
         const HKDF_INFO = new TextEncoder().encode("qwen-vision-e2ee");
 
@@ -822,8 +928,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const imagePreview = document.getElementById('imagePreview');
         const clearImageBtn = document.getElementById('clearImageBtn');
 
+        const systemPromptInput = document.getElementById('systemPromptInput');
+        const clearSystemBtn = document.getElementById('clearSystemBtn');
         const promptInput = document.getElementById('promptInput');
         const resetPromptBtn = document.getElementById('resetPromptBtn');
+        const bannedRegexInput = document.getElementById('bannedRegexInput');
+        const resetBannedBtn = document.getElementById('resetBannedBtn');
+
         const tempInput = document.getElementById('tempInput');
         const tempVal = document.getElementById('tempVal');
         const tokensInput = document.getElementById('tokensInput');
@@ -834,15 +945,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const copyBtn = document.getElementById('copyBtn');
         const copyText = document.getElementById('copyText');
 
+        const metadataPanel = document.getElementById('metadataPanel');
+        const highTagsContainer = document.getElementById('highTagsContainer');
+        const highTagsList = document.getElementById('highTagsList');
+        const tagsContainer = document.getElementById('tagsContainer');
+        const tagsList = document.getElementById('tagsList');
+        const finalPromptDisplay = document.getElementById('finalPromptDisplay');
+
         const emptyState = document.getElementById('emptyState');
         const loadingState = document.getElementById('loadingState');
         const loadingStatusText = document.getElementById('loadingStatusText');
         const markdownOutput = document.getElementById('markdownOutput');
 
         promptInput.value = DEFAULT_PROMPT;
+        bannedRegexInput.value = DEFAULT_BANNED;
+
         tempInput.addEventListener('input', (e) => tempVal.textContent = e.target.value);
         tokensInput.addEventListener('input', (e) => tokensVal.textContent = e.target.value);
         resetPromptBtn.addEventListener('click', () => promptInput.value = DEFAULT_PROMPT);
+        clearSystemBtn.addEventListener('click', () => systemPromptInput.value = "");
+        resetBannedBtn.addEventListener('click', () => bannedRegexInput.value = DEFAULT_BANNED);
 
         function arrayBufferToBase64(buffer) {
             let binary = '';
@@ -984,6 +1106,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             submitBtnText.textContent = "Processing...";
             emptyState.classList.add('hidden');
             markdownOutput.classList.add('hidden');
+            metadataPanel.classList.add('hidden');
             loadingState.classList.remove('hidden');
             loadingStatusText.textContent = "Establishing E2EE Handshake...";
 
@@ -1039,6 +1162,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const iv = window.crypto.getRandomValues(new Uint8Array(12));
                 const payloadData = JSON.stringify({
                     prompt: promptInput.value,
+                    system_prompt: systemPromptInput.value,
+                    banned_regex: bannedRegexInput.value,
                     image: currentBase64Image,
                     temperature: parseFloat(tempInput.value),
                     max_tokens: parseInt(tokensInput.value),
@@ -1096,6 +1221,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const decryptedJson = JSON.parse(new TextDecoder().decode(decryptedBytes));
                 rawOutputMarkdown = decryptedJson.content;
 
+                // Render Metadata & Tags in UI
+                tagsList.innerHTML = "";
+                highTagsList.innerHTML = "";
+
+                if (decryptedJson.high_tags && decryptedJson.high_tags.trim()) {
+                    highTagsContainer.classList.remove('hidden');
+                    decryptedJson.high_tags.split(',').forEach(tag => {
+                        const span = document.createElement('span');
+                        span.className = "px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20";
+                        span.textContent = tag.trim();
+                        highTagsList.appendChild(span);
+                    });
+                } else {
+                    highTagsContainer.classList.add('hidden');
+                }
+
+                if (decryptedJson.tags && decryptedJson.tags.trim()) {
+                    tagsContainer.classList.remove('hidden');
+                    decryptedJson.tags.split(',').forEach(tag => {
+                        const span = document.createElement('span');
+                        span.className = "px-2 py-0.5 rounded-md bg-indigo-500/10 text-indigo-300 border border-indigo-500/20";
+                        span.textContent = tag.trim();
+                        tagsList.appendChild(span);
+                    });
+                } else {
+                    tagsContainer.classList.add('hidden');
+                }
+
+                finalPromptDisplay.textContent = decryptedJson.final_prompt || promptInput.value;
+                metadataPanel.classList.remove('hidden');
+
+                // Render Markdown Output
                 markdownOutput.innerHTML = marked.parse(rawOutputMarkdown);
                 markdownOutput.querySelectorAll('pre code').forEach((el) => {
                     hljs.highlightElement(el);
@@ -1103,6 +1260,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 loadingState.classList.add('hidden');
                 markdownOutput.classList.remove('hidden');
+                lucide.createIcons();
 
             } catch (err) {
                 loadingState.classList.add('hidden');
