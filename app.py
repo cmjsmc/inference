@@ -1,5 +1,6 @@
 import base64
 import gc
+import io
 import json
 import logging
 import os
@@ -8,7 +9,20 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import timm
+import torch
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
+from PIL import Image
+from timm.data import create_transform, resolve_data_config
+from torch import Tensor, nn
+from torch.nn import functional as F
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -25,8 +39,12 @@ from llama_cpp import Llama
 from llama_cpp.llama_chat_format import Qwen35ChatHandler
 
 
-logging.basicConfig(level=logging.CRITICAL)
+# Completely silence logging and output
+logging.disable(logging.CRITICAL)
+logging.basicConfig(level=logging.CRITICAL, handlers=[logging.NullHandler()])
 logger = logging.getLogger("qwen36 studio")
+logger.setLevel(logging.CRITICAL)
+logger.propagate = False
 
 
 @contextmanager
@@ -52,20 +70,303 @@ def suppress_stdout_stderr():
             pass
 
 
-# MODEL_REPO = "unsloth/gemma-4-26B-A4B-it-GGUF"
-# MODEL_FILE = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
-# MMPROJ_FILE = "mmproj-F32.gguf"
-
+# ==============================================================================
+# VISION-LANGUAGE MODEL CONFIGURATION
+# ==============================================================================
 MODEL_REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 MODEL_FILE = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 MMPROJ_FILE = "mmproj-F32.gguf"
 
 llm_instance = None
+llm_lock = threading.Lock()
 session_keys: Dict[str, Tuple[ec.EllipticCurvePrivateKey, float]] = {}
 tasks: Dict[str, dict] = {}
 
 HKDF_SALT = b"qwen-vision-zero-leak-salt-2025"
 HKDF_INFO = b"qwen-vision-e2ee"
+
+
+# ==============================================================================
+# WD TAGGER & OVERLAP FILTER CONFIGURATION
+# ==============================================================================
+WD_MODEL_REPO_MAP = {
+    "eva02-canary": {
+        "repo_id": "ashen-sensored/wd-eva02-tagger-2026-canary",
+        "model_file": "model.safetensors",
+        "tags_file": "selected_tags.csv",
+        "arch": "eva02_large_patch14_448",
+    },
+    "vit": {
+        "repo_id": "SmilingWolf/wd-vit-tagger-v3",
+        "model_file": None,
+        "tags_file": "selected_tags.csv",
+        "arch": None,
+    },
+    "swinv2": {
+        "repo_id": "SmilingWolf/wd-swinv2-tagger-v3",
+        "model_file": None,
+        "tags_file": "selected_tags.csv",
+        "arch": None,
+    },
+    "convnext": {
+        "repo_id": "SmilingWolf/wd-convnext-tagger-v3",
+        "model_file": None,
+        "tags_file": "selected_tags.csv",
+        "arch": None,
+    },
+}
+
+ACTIVE_WD_MODEL = "eva02-canary"
+WD_GEN_THRESHOLD = 0.35
+WD_CHAR_THRESHOLD = 0.75
+WD_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CHANGE_MAP = [
+    ["from behind", "shot from behind"],
+    ["from below", "shot from a low angle"],
+    ["from above", "shot from a high angle"],
+    ["all fours", "on all fours"],
+    ["1girl", "a female"],
+    ["1boy", "a male"],
+
+    ["oral", "oral sex"],
+    ["vaginal", "vaginal sex"],
+    ["anal", "anal sex"],
+    ["sex", "having sex"],
+    ["all fours", "on all fours"],
+
+]
+
+IMPORTANT_TAGS = [
+    "POV", "shot from a low angle", "shot from a high angle", "shot from behind",
+    "on all fours", "straddling",
+    "squatting", "kneeling", "sitting", "standing", 
+    "indoors", "outdoors",
+    
+    "anal penetration", "anal sex",
+    "vaginal penetration", "vaginal sex",
+    "oral sex", "blowjob", "deepthroat",
+    "implied sex", "implied penetration",
+    "penis", "testicles", "ass", "pussy",
+    "nude",
+]
+
+wd_model_instance: Optional[nn.Module] = None
+wd_labels_instance: Optional["LabelData"] = None
+wd_transform_instance = None
+overlap_dict_instance: Optional[dict[str, list[str]]] = None
+
+
+@dataclass
+class LabelData:
+    names: list[str]
+    rating: list[np.int64]
+    general: list[np.int64]
+    character: list[np.int64]
+
+
+def pil_ensure_rgb(image: Image.Image) -> Image.Image:
+    """Converts in-RAM image to RGB/RGBA on a neutral white canvas."""
+    if image.mode not in ["RGB", "RGBA"]:
+        image = image.convert("RGBA") if "transparency" in image.info else image.convert("RGB")
+    if image.mode == "RGBA":
+        canvas = Image.new("RGBA", image.size, (255, 255, 255))
+        canvas.alpha_composite(image)
+        image = canvas.convert("RGB")
+    return image
+
+
+def pil_pad_square(image: Image.Image) -> Image.Image:
+    """Pads image to square with a white background entirely in RAM."""
+    w, h = image.size
+    px = max(image.size)
+    canvas = Image.new("RGB", (px, px), (255, 255, 255))
+    canvas.paste(image, ((px - w) // 2, (px - h) // 2))
+    return canvas
+
+
+def load_labels_hf(repo_id: str, filename: str = "selected_tags.csv") -> LabelData:
+    try:
+        csv_path = hf_hub_download(repo_id=repo_id, filename=filename)
+        csv_path = Path(csv_path).resolve()
+    except HfHubHTTPError as e:
+        raise FileNotFoundError(f"{filename} failed to download from {repo_id}") from e
+
+    df: pd.DataFrame = pd.read_csv(csv_path, usecols=["name", "category"])
+    return LabelData(
+        names=df["name"].tolist(),
+        rating=list(np.where(df["category"] == 9)[0]),
+        general=list(np.where(df["category"] == 0)[0]),
+        character=list(np.where(df["category"] == 4)[0]),
+    )
+
+
+def load_overlap_dict() -> dict[str, list[str]]:
+    """Loads tag overlap dictionary from Hugging Face cache into RAM."""
+    try:
+        json_file = hf_hub_download(
+            "alea31415/tag_filtering",
+            "overlap_tags_simplified.json",
+            repo_type="dataset",
+        )
+        with open(json_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def load_wd_tagger(model_key: str = ACTIVE_WD_MODEL):
+    """Pre-caches WD model weights, label mappings, transform, and overlap dict in memory with CUDA OOM safety."""
+    global wd_model_instance, wd_labels_instance, wd_transform_instance, overlap_dict_instance, WD_DEVICE
+    if wd_model_instance is None:
+        target_cfg = WD_MODEL_REPO_MAP.get(model_key, WD_MODEL_REPO_MAP["eva02-canary"])
+        repo_id = target_cfg["repo_id"]
+        model_file = target_cfg["model_file"]
+        tags_file = target_cfg["tags_file"]
+        arch = target_cfg["arch"]
+
+        try:
+            model = timm.create_model("hf-hub:" + repo_id, pretrained=True).eval()
+        except Exception:
+            try:
+                model = timm.create_model("hf-hub:" + repo_id, pretrained=False).eval()
+                if model_file:
+                    state_dict = timm.models.load_state_dict_from_hf(repo_id, filename=model_file)
+                else:
+                    state_dict = timm.models.load_state_dict_from_hf(repo_id)
+                model.load_state_dict(state_dict)
+            except Exception:
+                arch_name = arch or "eva02_large_patch14_448"
+                try:
+                    model = timm.create_model(arch_name, pretrained=False, num_classes=16473).eval()
+                except Exception:
+                    model = timm.create_model("eva02_large_patch14_448.mim_m38m_ft_in22k_in1k", pretrained=False, num_classes=16473).eval()
+
+                weights_path = hf_hub_download(repo_id=repo_id, filename=model_file or "model.safetensors")
+                try:
+                    from safetensors.torch import load_file as load_safetensors
+                    state_dict = load_safetensors(weights_path)
+                except ImportError:
+                    state_dict = torch.load(weights_path, map_location="cpu")
+                model.load_state_dict(state_dict)
+
+        # Enforce exact EVA02 / WD V3 data transform (Bicubic, 448x448, crop_pct=1.0, mean/std=0.5)
+        wd_transform_instance = create_transform(
+            input_size=448,
+            interpolation="bicubic",
+            crop_pct=1.0,
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+        )
+
+        # Attempt to load onto GPU in FP16 to halve VRAM; fallback gracefully to CPU on OOM
+        if WD_DEVICE.type == "cuda":
+            try:
+                wd_model_instance = model.half().to(WD_DEVICE)
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                WD_DEVICE = torch.device("cpu")
+                wd_model_instance = model.float().to("cpu")
+        else:
+            wd_model_instance = model.float().to("cpu")
+
+        wd_labels_instance = load_labels_hf(repo_id=repo_id, filename=tags_file)
+        overlap_dict_instance = load_overlap_dict()
+
+    return wd_model_instance, wd_labels_instance, wd_transform_instance, overlap_dict_instance
+
+
+def get_raw_tags(probs: Tensor, labels: LabelData, gen_threshold: float, char_threshold: float) -> list[str]:
+    """Sorts and extracts prediction tags by confidence threshold."""
+    probs_list = list(zip(labels.names, probs.numpy()))
+
+    gen_labels = [probs_list[i] for i in labels.general if probs_list[i][1] > gen_threshold]
+    gen_labels.sort(key=lambda item: item[1], reverse=True)
+
+    char_labels = [probs_list[i] for i in labels.character if probs_list[i][1] > char_threshold]
+    char_labels.sort(key=lambda item: item[1], reverse=True)
+
+    combined_names = [x[0] for x in gen_labels] + [x[0] for x in char_labels]
+    return combined_names
+
+
+def filter_overlap_tags(tags: list[str], overlap_dict: dict[str, list[str]], check_superwords: bool = True) -> list[str]:
+    """Filters redundant overlap tags and superwords."""
+    if not tags:
+        return []
+
+    tags_underscore = [t.replace(" ", "_") for t in tags]
+    tags_underscore_set = set(tags_underscore)
+    result: list[str] = []
+
+    for tag, tag_ in zip(tags, tags_underscore):
+        to_remove = False
+
+        if tag_ in overlap_dict:
+            overlap_values = set(overlap_dict[tag_])
+            if overlap_values.intersection(tags_underscore_set):
+                to_remove = True
+
+        if not to_remove and check_superwords:
+            for tag_another_ in tags_underscore:
+                if tag_ != tag_another_ and tag_ in tag_another_:
+                    to_remove = True
+                    break
+
+        if not to_remove:
+            result.append(tag)
+
+    return result
+
+
+def process_tags_pipeline(image_data: bytearray) -> tuple[str, str]:
+    """Executes WD model inference, removes overlaps, applies CHANGE_MAP, and detects IMPORTANT_TAGS in RAM."""
+    global WD_DEVICE
+    wd_model, labels, transform, overlap_dict = load_wd_tagger()
+
+    with Image.open(io.BytesIO(image_data)) as pil_img:
+        rgb_img = pil_ensure_rgb(pil_img)
+        padded_img = pil_pad_square(rgb_img)
+        inputs: Tensor = transform(padded_img).unsqueeze(0)[:, [2, 1, 0]]
+        del rgb_img, padded_img
+
+    if WD_DEVICE.type == "cuda":
+        inputs = inputs.half().to(WD_DEVICE)
+    else:
+        inputs = inputs.float().to(WD_DEVICE)
+
+    with suppress_stdout_stderr(), torch.inference_mode():
+        try:
+            outputs = wd_model(inputs)
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            # Fallback to CPU on live VRAM contention
+            WD_DEVICE = torch.device("cpu")
+            wd_model = wd_model.float().to("cpu")
+            inputs = inputs.float().to("cpu")
+            outputs = wd_model(inputs)
+
+        outputs = F.sigmoid(outputs)
+        probs = outputs.squeeze(0).float().cpu()
+
+    # 1. Tag Inference
+    raw_tags = get_raw_tags(probs, labels, WD_GEN_THRESHOLD, WD_CHAR_THRESHOLD)
+
+    # 2. Remove Overlap
+    filtered_tags = filter_overlap_tags(raw_tags, overlap_dict or {}, check_superwords=True)
+    tags_spaced = [t.replace("_", " ") for t in filtered_tags]
+
+    # 3. Apply CHANGE_MAP
+    change_map_dict = {src.lower(): dst for src, dst in CHANGE_MAP}
+    edited_tags = [change_map_dict.get(t.lower(), t) for t in tags_spaced]
+
+    # 4. Check IMPORTANT_TAGS
+    edited_tags_lower = {t.lower() for t in edited_tags}
+    high_tags_present = [imp for imp in IMPORTANT_TAGS if imp.lower() in edited_tags_lower]
+
+    tags_present = ", ".join(edited_tags)
+    high_tags_present_str = ", ".join(high_tags_present)
+
+    del inputs, outputs, probs, raw_tags, filtered_tags, tags_spaced, edited_tags, edited_tags_lower
+    return tags_present, high_tags_present_str
 
 
 def zero_mem(target):
@@ -112,16 +413,12 @@ def load_model():
             n_ctx=8192,
             n_threads=2,
             n_threads_batch=2,
-
             n_batch=4096,
             n_ubatch=1024,
             n_seq_max=2,
-
             flash_attn=False,
-
-            verbose=False, verbosity=1, log_filters=["a", "the", "is", "e", "i", "o", "u"],
-            log_filters_case_sensitive=False,
-
+            verbose=False,
+            verbosity=0,
             load_mode=llama_cpp.llama_load_mode.LLAMA_LOAD_MODE_MMAP_MLOCK,
         )
     return llm_instance
@@ -142,11 +439,16 @@ def cleanup_expired_records():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_model()
+    load_wd_tagger()
     yield
-    global llm_instance, session_keys, tasks
+    global llm_instance, wd_model_instance, wd_labels_instance, wd_transform_instance, overlap_dict_instance, session_keys, tasks
     session_keys.clear()
     tasks.clear()
     del llm_instance
+    del wd_model_instance
+    del wd_labels_instance
+    del wd_transform_instance
+    del overlap_dict_instance
     gc.collect()
 
 
@@ -200,21 +502,43 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
         temperature = float(decrypted_dict.get("temperature", 0.2))
         del decrypted_dict
 
-        # 3. Model Execution
+        # 3. Perform Tag Extraction, Overlap Removal, and Prompt Formatting In-RAM
+        b64_part = image_str.split(",", 1)[1] if "," in image_str else image_str
+        image_buf = bytearray(base64.b64decode(b64_part))
+
+        try:
+            tags_present, high_tags_present = process_tags_pipeline(image_buf)
+        finally:
+            # Strictly wipe the decoded image buffer even if tagging fails
+            zero_mem(image_buf)
+            del image_buf
+
+        if tags_present:
+            tags_prompt = f"Describe the image through concise, clear sentences, making use of the following keywords, if relevant: [{tags_present}]"
+            if high_tags_present:
+                high_impact_prompt = f"{tags_prompt} You must include the following keywords: [{high_tags_present}]"
+                final_prompt = f"{prompt_str}\n\n{high_impact_prompt}".strip() if prompt_str else high_impact_prompt
+            else:
+                final_prompt = f"{prompt_str}\n\n{tags_prompt}".strip() if prompt_str else tags_prompt
+        else:
+            final_prompt = prompt_str
+
+        # 4. Model Execution (Thread-Safe)
         model = load_model()
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt_str},
+                    {"type": "text", "text": final_prompt},
                     {"type": "image_url", "image_url": {"url": image_str}},
                 ],
             }
         ]
         del prompt_str
+        del final_prompt
         del image_str
 
-        with suppress_stdout_stderr():
+        with llm_lock, suppress_stdout_stderr():
             model.reset()
             response = model.create_chat_completion(
                 messages=messages,
@@ -222,14 +546,16 @@ def process_inference_task(task_id: str, server_priv: ec.EllipticCurvePrivateKey
                 temperature=temperature,
                 top_p=0.80,
                 min_p=0.05,
-                present_penalty=0.01, repeat_penalty=1.01, penalty_last_n=64,
+                present_penalty=0.01,
+                repeat_penalty=1.01,
+                penalty_last_n=64,
             )
         del messages
 
         content_str = response["choices"][0]["message"]["content"]
         del response
 
-        # 4. Re-Encrypt Response
+        # 5. Re-Encrypt Response
         resp_bytes = bytearray(json.dumps({"content": content_str}).encode("utf-8"))
         del content_str
 
@@ -546,10 +872,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             return json;
         }
 
-        // Explicitly renames and converts image to standard base64 in browser memory
         function processAndSanitizeImage(rawFile, maxDimension = 1024) {
             return new Promise((resolve, reject) => {
-                // Explicitly rename File to "image_01.jpg"
                 const sanitizedFile = new File([rawFile], "image_01.jpg", {
                     type: rawFile.type || "image/jpeg",
                     lastModified: Date.now()
@@ -664,11 +988,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             loadingStatusText.textContent = "Establishing E2EE Handshake...";
 
             try {
-                // 1. Handshake
                 const hsResp = await fetch('/api/handshake');
                 const { session_id, server_public_key } = await parseResponse(hsResp);
 
-                // 2. Client Keypair Generation
                 const clientKeyPair = await window.crypto.subtle.generateKey(
                     { name: "ECDH", namedCurve: "P-256" },
                     false,
@@ -687,7 +1009,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     []
                 );
 
-                // 3. Derive Shared Key
                 const sharedSecretBits = await window.crypto.subtle.deriveBits(
                     { name: "ECDH", public: serverPubKey },
                     clientKeyPair.privateKey,
@@ -715,7 +1036,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     ["encrypt", "decrypt"]
                 );
 
-                // 4. Encrypt Payload
                 const iv = window.crypto.getRandomValues(new Uint8Array(12));
                 const payloadData = JSON.stringify({
                     prompt: promptInput.value,
@@ -731,7 +1051,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     payloadBytes
                 );
 
-                // 5. Submit Task
                 loadingStatusText.textContent = "Encrypting & Queuing Task...";
                 const response = await fetch('/api/generate', {
                     method: 'POST',
@@ -746,7 +1065,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 const { task_id } = await parseResponse(response);
 
-                // 6. Polling Loop
                 let encResponse = null;
                 let elapsedSeconds = 0;
 
@@ -765,7 +1083,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     }
                 }
 
-                // 7. Decrypt in Browser
                 loadingStatusText.textContent = "Decrypting Output in Browser...";
                 const respIv = base64ToArrayBuffer(encResponse.iv);
                 const respCiphertext = base64ToArrayBuffer(encResponse.ciphertext);
@@ -779,7 +1096,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const decryptedJson = JSON.parse(new TextDecoder().decode(decryptedBytes));
                 rawOutputMarkdown = decryptedJson.content;
 
-                // 8. Render Markdown
                 markdownOutput.innerHTML = marked.parse(rawOutputMarkdown);
                 markdownOutput.querySelectorAll('pre code').forEach((el) => {
                     hljs.highlightElement(el);
@@ -826,5 +1142,6 @@ if __name__ == "__main__":
         port=7860,
         reload=False,
         access_log=False,
+        log_level="critical",
         timeout_keep_alive=180,
     )
