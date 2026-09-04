@@ -117,8 +117,8 @@ WD_MODEL_REPO_MAP = {
 }
 
 ACTIVE_WD_MODEL = "eva02-canary"
-WD_GEN_THRESHOLD = 0.35
-WD_CHAR_THRESHOLD = 0.75
+WD_GEN_THRESHOLD = 0.4
+WD_CHAR_THRESHOLD = 0.95
 WD_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CHANGE_MAP = [
